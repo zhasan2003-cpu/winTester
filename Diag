@@ -1,0 +1,1720 @@
+#requires -version 3.0
+<#
+PC_Full_Diagnostic.ps1
+Professional Windows Performance Diagnostics Script
+Compatibility: Windows 8.1 / Windows 10 / Windows 11 / PowerShell 5.1
+No third-party tools. Built-in Windows tools only.
+#>
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = "Continue"
+
+$Script:StartTime = Get-Date
+$Script:DesktopPath = [Environment]::GetFolderPath("Desktop")
+$Script:RootPath = Join-Path $Script:DesktopPath "PC_Diagnostics"
+$Script:ReportsPath = Join-Path $Script:RootPath "Reports"
+$Script:LogsPath = Join-Path $Script:RootPath "Logs"
+$Script:RawPath = Join-Path $Script:RootPath "Raw"
+$Script:CsvPath = Join-Path $Script:RootPath "CSV"
+$Script:ErrorsFile = Join-Path $Script:LogsPath "ERRORS.txt"
+$Script:SummaryFile = Join-Path $Script:RootPath "SUMMARY.txt"
+$Script:ZipPath = Join-Path $Script:DesktopPath ("PC_Diagnostics_{0}.zip" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+
+$Script:Findings = New-Object System.Collections.ArrayList
+$Script:Metrics = @{
+    AvgCpu = $null
+    MaxCpu = $null
+    AvgAvailableMemoryMB = $null
+    MinAvailableMemoryMB = $null
+    AvgDiskQueue = $null
+    MaxDiskQueue = $null
+    AvgDiskReadMBs = $null
+    AvgDiskWriteMBs = $null
+    DiskErrorCount = 0
+    NtfsErrorCount = 0
+    KernelPowerCount = 0
+    WheaCount = 0
+    BugCheckCount = 0
+    UnsignedDriverCount = 0
+    StartupCount = 0
+    DefenderCpu = 0
+    ChromeCpu = 0
+    SmartWarningCount = 0
+    LowFreeSpaceVolumes = @()
+    SuspiciousPrograms = @()
+}
+
+function Initialize-Environment {
+    try {
+        if (Test-Path $Script:RootPath) {
+            $oldPath = Join-Path $Script:DesktopPath ("PC_Diagnostics_Old_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+            Rename-Item -Path $Script:RootPath -NewName (Split-Path $oldPath -Leaf) -ErrorAction SilentlyContinue
+        }
+
+        New-Item -ItemType Directory -Force -Path $Script:RootPath | Out-Null
+        New-Item -ItemType Directory -Force -Path $Script:ReportsPath | Out-Null
+        New-Item -ItemType Directory -Force -Path $Script:LogsPath | Out-Null
+        New-Item -ItemType Directory -Force -Path $Script:RawPath | Out-Null
+        New-Item -ItemType Directory -Force -Path $Script:CsvPath | Out-Null
+
+        "PC Diagnostics started: $(Get-Date)" | Out-File -FilePath $Script:ErrorsFile -Encoding UTF8
+    }
+    catch {
+        Write-Host "Cannot initialize folders: $($_.Exception.Message)"
+    }
+}
+
+function Write-Log {
+    param(
+        [string]$Message,
+        [string]$Level = "INFO"
+    )
+
+    try {
+        $line = "[{0}] [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
+        Add-Content -Path $Script:ErrorsFile -Value $line -Encoding UTF8
+    }
+    catch {
+        Write-Host $Message
+    }
+}
+
+function Add-Finding {
+    param(
+        [string]$Severity,
+        [string]$Category,
+        [string]$Message,
+        [string]$Recommendation
+    )
+
+    try {
+        $obj = New-Object PSObject -Property @{
+            Severity = $Severity
+            Category = $Category
+            Message = $Message
+            Recommendation = $Recommendation
+        }
+        [void]$Script:Findings.Add($obj)
+    }
+    catch {
+        Write-Log "Add-Finding failed: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Test-IsAdmin {
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Save-Text {
+    param(
+        [string]$Path,
+        [string]$Text
+    )
+
+    try {
+        $Text | Out-File -FilePath $Path -Encoding UTF8 -Width 4096
+    }
+    catch {
+        Write-Log "Save-Text failed for $Path : $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Append-Text {
+    param(
+        [string]$Path,
+        [string]$Text
+    )
+
+    try {
+        $Text | Out-File -FilePath $Path -Encoding UTF8 -Append -Width 4096
+    }
+    catch {
+        Write-Log "Append-Text failed for $Path : $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Export-Object {
+    param(
+        [object]$Object,
+        [string]$TxtPath,
+        [string]$CsvPath = $null
+    )
+
+    try {
+        $Object | Format-List * | Out-File -FilePath $TxtPath -Encoding UTF8 -Width 4096
+        if ($CsvPath) {
+            $Object | Export-Csv -Path $CsvPath -Encoding UTF8 -NoTypeInformation
+        }
+    }
+    catch {
+        Write-Log "Export-Object failed for $TxtPath : $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Invoke-CommandSafe {
+    param(
+        [string]$FilePath,
+        [string]$Arguments,
+        [string]$OutputFile,
+        [int]$TimeoutSeconds = 900
+    )
+
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $FilePath
+        $psi.Arguments = $Arguments
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $psi
+
+        $null = $process.Start()
+        $completed = $process.WaitForExit($TimeoutSeconds * 1000)
+
+        if (-not $completed) {
+            try {
+                $process.Kill()
+            }
+            catch {
+            }
+            Append-Text -Path $OutputFile -Text "Command timed out: $FilePath $Arguments"
+            Write-Log "Command timed out: $FilePath $Arguments" "WARN"
+            return
+        }
+
+        $stdout = $process.StandardOutput.ReadToEnd()
+        $stderr = $process.StandardError.ReadToEnd()
+
+        Append-Text -Path $OutputFile -Text "COMMAND: $FilePath $Arguments"
+        Append-Text -Path $OutputFile -Text "EXIT CODE: $($process.ExitCode)"
+        Append-Text -Path $OutputFile -Text "----- STDOUT -----"
+        Append-Text -Path $OutputFile -Text $stdout
+        Append-Text -Path $OutputFile -Text "----- STDERR -----"
+        Append-Text -Path $OutputFile -Text $stderr
+        Append-Text -Path $OutputFile -Text "`r`n"
+    }
+    catch {
+        Append-Text -Path $OutputFile -Text "FAILED: $FilePath $Arguments"
+        Append-Text -Path $OutputFile -Text $_.Exception.Message
+        Write-Log "Invoke-CommandSafe failed: $FilePath $Arguments : $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Get-CimSafe {
+    param(
+        [string]$ClassName,
+        [string]$Namespace = "root\cimv2",
+        [string]$Filter = $null
+    )
+
+    try {
+        if ($Filter) {
+            return Get-CimInstance -Namespace $Namespace -ClassName $ClassName -Filter $Filter -ErrorAction Stop
+        }
+        else {
+            return Get-CimInstance -Namespace $Namespace -ClassName $ClassName -ErrorAction Stop
+        }
+    }
+    catch {
+        try {
+            if ($Filter) {
+                return Get-WmiObject -Namespace $Namespace -Class $ClassName -Filter $Filter -ErrorAction Stop
+            }
+            else {
+                return Get-WmiObject -Namespace $Namespace -Class $ClassName -ErrorAction Stop
+            }
+        }
+        catch {
+            Write-Log "WMI/CIM failed: $Namespace $ClassName : $($_.Exception.Message)" "ERROR"
+            return $null
+        }
+    }
+}
+
+function Convert-BytesToGB {
+    param([double]$Bytes)
+
+    try {
+        if ($null -eq $Bytes) {
+            return $null
+        }
+        return [math]::Round(($Bytes / 1GB), 2)
+    }
+    catch {
+        return $null
+    }
+}
+
+function Decode-SmartAttributes {
+    param(
+        [byte[]]$VendorSpecific
+    )
+
+    $results = @()
+
+    try {
+        if ($null -eq $VendorSpecific -or $VendorSpecific.Length -lt 362) {
+            return $results
+        }
+
+        for ($i = 2; $i -lt 362; $i += 12) {
+            $id = $VendorSpecific[$i]
+            if ($id -eq 0) {
+                continue
+            }
+
+            $flags = [BitConverter]::ToUInt16($VendorSpecific, $i + 1)
+            $current = $VendorSpecific[$i + 3]
+            $worst = $VendorSpecific[$i + 4]
+            $rawBytes = $VendorSpecific[($i + 5)..($i + 10)]
+            [UInt64]$raw = 0
+
+            for ($b = 0; $b -lt 6; $b++) {
+                $raw += ([UInt64]$rawBytes[$b] -shl (8 * $b))
+            }
+
+            $name = switch ($id) {
+                1 { "Read Error Rate" }
+                3 { "Spin-Up Time" }
+                4 { "Start/Stop Count" }
+                5 { "Reallocated Sectors Count" }
+                7 { "Seek Error Rate" }
+                9 { "Power-On Hours" }
+                10 { "Spin Retry Count" }
+                12 { "Power Cycle Count" }
+                184 { "End-to-End Error" }
+                187 { "Reported Uncorrectable Errors" }
+                188 { "Command Timeout" }
+                190 { "Airflow Temperature" }
+                191 { "G-Sense Error Rate" }
+                192 { "Power-Off Retract Count" }
+                193 { "Load/Unload Cycle Count" }
+                194 { "Temperature" }
+                196 { "Reallocation Event Count" }
+                197 { "Current Pending Sector Count" }
+                198 { "Uncorrectable Sector Count" }
+                199 { "UltraDMA CRC Error Count" }
+                200 { "Write Error Rate" }
+                201 { "Soft Read Error Rate" }
+                202 { "Data Address Mark Errors" }
+                233 { "Media Wearout Indicator" }
+                241 { "Total LBAs Written" }
+                242 { "Total LBAs Read" }
+                default { "SMART Attribute $id" }
+            }
+
+            $obj = New-Object PSObject -Property @{
+                ID = $id
+                Name = $name
+                Current = $current
+                Worst = $worst
+                Flags = $flags
+                Raw = $raw
+            }
+
+            $results += $obj
+        }
+    }
+    catch {
+        Write-Log "Decode-SmartAttributes failed: $($_.Exception.Message)" "ERROR"
+    }
+
+    return $results
+}
+
+function Collect-SystemInformation {
+    Write-Host "Collecting system information..."
+
+    $out = Join-Path $Script:ReportsPath "01_System_Information.txt"
+
+    try {
+        Append-Text $out "=== ADMIN ==="
+        Append-Text $out ("Running as administrator: {0}" -f (Test-IsAdmin))
+        if (-not (Test-IsAdmin)) {
+            Add-Finding "WARN" "Permissions" "Скрипт запущен не от имени администратора. Часть данных может быть недоступна." "Запустить PowerShell от имени администратора и повторить диагностику."
+        }
+
+        Append-Text $out "`r`n=== COMPUTER SYSTEM ==="
+        $cs = Get-CimSafe -ClassName Win32_ComputerSystem
+        Export-Object $cs $out
+
+        Append-Text $out "`r`n=== OPERATING SYSTEM ==="
+        $os = Get-CimSafe -ClassName Win32_OperatingSystem
+        Export-Object $os $out
+
+        Append-Text $out "`r`n=== BIOS ==="
+        $bios = Get-CimSafe -ClassName Win32_BIOS
+        Export-Object $bios $out
+
+        Append-Text $out "`r`n=== BASEBOARD / MOTHERBOARD ==="
+        $bb = Get-CimSafe -ClassName Win32_BaseBoard
+        Export-Object $bb $out
+
+        Append-Text $out "`r`n=== CPU ==="
+        $cpu = Get-CimSafe -ClassName Win32_Processor
+        Export-Object $cpu $out
+
+        Append-Text $out "`r`n=== RAM MODULES ==="
+        $ram = Get-CimSafe -ClassName Win32_PhysicalMemory
+        Export-Object $ram $out (Join-Path $Script:CsvPath "RAM_Modules.csv")
+
+        Append-Text $out "`r`n=== GPU ==="
+        $gpu = Get-CimSafe -ClassName Win32_VideoController
+        Export-Object $gpu $out (Join-Path $Script:CsvPath "GPU.csv")
+
+        Append-Text $out "`r`n=== MONITORS ==="
+        $mon = Get-CimSafe -Namespace "root\wmi" -ClassName WmiMonitorID
+        Export-Object $mon $out (Join-Path $Script:CsvPath "Monitors.csv")
+
+        Append-Text $out "`r`n=== PNP MONITORS ==="
+        $pnpMon = Get-CimSafe -ClassName Win32_PnPEntity -Filter "PNPClass='Monitor'"
+        Export-Object $pnpMon $out
+
+        Append-Text $out "`r`n=== UEFI / SECURE BOOT ==="
+        try {
+            $secureBoot = Confirm-SecureBootUEFI -ErrorAction Stop
+            Append-Text $out "Secure Boot: $secureBoot"
+            Append-Text $out "Boot mode: UEFI likely available."
+        }
+        catch {
+            Append-Text $out "Confirm-SecureBootUEFI unavailable or system is Legacy BIOS. Message: $($_.Exception.Message)"
+        }
+
+        Append-Text $out "`r`n=== SYSTEMINFO ==="
+        Invoke-CommandSafe -FilePath "cmd.exe" -Arguments "/c systeminfo" -OutputFile $out -TimeoutSeconds 300
+
+        Append-Text $out "`r`n=== SERIALS SUMMARY ==="
+        if ($bios) {
+            Append-Text $out ("BIOS SerialNumber: {0}" -f $bios.SerialNumber)
+        }
+        if ($cs) {
+            Append-Text $out ("Manufacturer: {0}" -f $cs.Manufacturer)
+            Append-Text $out ("Model: {0}" -f $cs.Model)
+        }
+        if ($bb) {
+            Append-Text $out ("BaseBoard SerialNumber: {0}" -f $bb.SerialNumber)
+            Append-Text $out ("BaseBoard Product: {0}" -f $bb.Product)
+        }
+    }
+    catch {
+        Write-Log "Collect-SystemInformation failed: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Collect-DiskInformation {
+    Write-Host "Collecting disk information..."
+
+    $out = Join-Path $Script:ReportsPath "02_Disks.txt"
+    $smartCsv = Join-Path $Script:CsvPath "SMART_Attributes.csv"
+    $logicalCsv = Join-Path $Script:CsvPath "Logical_Disks.csv"
+
+    try {
+        Append-Text $out "=== DISK DRIVES ==="
+        $drives = Get-CimSafe -ClassName Win32_DiskDrive
+        Export-Object $drives $out (Join-Path $Script:CsvPath "Disk_Drives.csv")
+
+        Append-Text $out "`r`n=== LOGICAL DISKS ==="
+        $logical = Get-CimSafe -ClassName Win32_LogicalDisk
+        Export-Object $logical $out $logicalCsv
+
+        if ($logical) {
+            foreach ($vol in $logical) {
+                try {
+                    if ($vol.DriveType -eq 3 -and $vol.Size -gt 0) {
+                        $freePercent = [math]::Round(($vol.FreeSpace / $vol.Size) * 100, 2)
+                        if ($freePercent -lt 10) {
+                            $Script:Metrics.LowFreeSpaceVolumes += "$($vol.DeviceID) free $freePercent%"
+                            Add-Finding "WARN" "Disk Space" "На диске $($vol.DeviceID) мало свободного места: $freePercent%." "Освободить место или увеличить объем диска. Для стабильной работы желательно держать свободными минимум 15-20%."
+                        }
+                    }
+                }
+                catch {
+                    Write-Log "Logical disk analysis failed: $($_.Exception.Message)" "ERROR"
+                }
+            }
+        }
+
+        Append-Text $out "`r`n=== PARTITIONS ==="
+        $parts = Get-CimSafe -ClassName Win32_DiskPartition
+        Export-Object $parts $out (Join-Path $Script:CsvPath "Disk_Partitions.csv")
+
+        Append-Text $out "`r`n=== DISK TO PARTITION LINKS ==="
+        $links1 = Get-CimSafe -ClassName Win32_DiskDriveToDiskPartition
+        Export-Object $links1 $out
+
+        Append-Text $out "`r`n=== LOGICAL DISK TO PARTITION LINKS ==="
+        $links2 = Get-CimSafe -ClassName Win32_LogicalDiskToPartition
+        Export-Object $links2 $out
+
+        Append-Text $out "`r`n=== STORAGE PHYSICAL DISKS ==="
+        try {
+            $physical = Get-PhysicalDisk -ErrorAction Stop
+            Export-Object $physical $out (Join-Path $Script:CsvPath "Physical_Disks.csv")
+        }
+        catch {
+            Append-Text $out "Get-PhysicalDisk unavailable: $($_.Exception.Message)"
+        }
+
+        Append-Text $out "`r`n=== VOLUMES ==="
+        try {
+            $volumes = Get-Volume -ErrorAction Stop
+            Export-Object $volumes $out (Join-Path $Script:CsvPath "Volumes.csv")
+        }
+        catch {
+            Append-Text $out "Get-Volume unavailable: $($_.Exception.Message)"
+        }
+
+        Append-Text $out "`r`n=== SATA / IDE / AHCI CONTROLLERS ==="
+        $controllers = Get-CimSafe -ClassName Win32_IDEController
+        Export-Object $controllers $out (Join-Path $Script:CsvPath "IDE_SATA_Controllers.csv")
+
+        Append-Text $out "`r`n=== SCSI CONTROLLERS ==="
+        $scsiControllers = Get-CimSafe -ClassName Win32_SCSIController
+        Export-Object $scsiControllers $out (Join-Path $Script:CsvPath "SCSI_Controllers.csv")
+
+        Append-Text $out "`r`n=== PNP STORAGE CONTROLLERS ==="
+        $storagePnP = Get-CimSafe -ClassName Win32_PnPEntity
+        if ($storagePnP) {
+            $storagePnPFiltered = $storagePnP | Where-Object {
+                $_.Name -match "SATA|AHCI|IDE|NVMe|Storage|RAID|SCSI|Controller"
+            }
+            Export-Object $storagePnPFiltered $out (Join-Path $Script:CsvPath "Storage_PNP.csv")
+        }
+
+        Append-Text $out "`r`n=== SMART FAILURE PREDICT STATUS ==="
+        $smartStatus = Get-CimSafe -Namespace "root\wmi" -ClassName MSStorageDriver_FailurePredictStatus
+        Export-Object $smartStatus $out (Join-Path $Script:CsvPath "SMART_Status.csv")
+
+        if ($smartStatus) {
+            foreach ($s in $smartStatus) {
+                if ($s.PredictFailure -eq $true) {
+                    $Script:Metrics.SmartWarningCount++
+                    Add-Finding "CRITICAL" "SMART" "SMART PredictFailure=True для устройства $($s.InstanceName)." "Срочно сделать резервную копию и заменить диск."
+                }
+            }
+        }
+
+        Append-Text $out "`r`n=== SMART ATTRIBUTES ==="
+        $smartData = Get-CimSafe -Namespace "root\wmi" -ClassName MSStorageDriver_FailurePredictData
+        $allAttrs = @()
+
+        if ($smartData) {
+            foreach ($d in $smartData) {
+                $attrs = Decode-SmartAttributes -VendorSpecific $d.VendorSpecific
+                foreach ($a in $attrs) {
+                    $allAttrs += New-Object PSObject -Property @{
+                        InstanceName = $d.InstanceName
+                        ID = $a.ID
+                        Name = $a.Name
+                        Current = $a.Current
+                        Worst = $a.Worst
+                        Raw = $a.Raw
+                    }
+
+                    if (($a.ID -eq 5 -or $a.ID -eq 196 -or $a.ID -eq 197 -or $a.ID -eq 198 -or $a.ID -eq 187) -and $a.Raw -gt 0) {
+                        Add-Finding "CRITICAL" "SMART" "Обнаружен проблемный SMART-атрибут: $($a.Name), Raw=$($a.Raw), устройство=$($d.InstanceName)." "Сделать резервную копию. Проверить диск. При росте значения заменить накопитель."
+                        $Script:Metrics.SmartWarningCount++
+                    }
+
+                    if ($a.ID -eq 199 -and $a.Raw -gt 0) {
+                        Add-Finding "WARN" "SMART" "Есть UltraDMA CRC Error Count Raw=$($a.Raw), устройство=$($d.InstanceName)." "Проверить SATA-кабель/контакты/разъем. На ноутбуке проверить посадку диска."
+                    }
+                }
+            }
+
+            $allAttrs | Sort-Object InstanceName, ID | Format-Table -AutoSize | Out-String -Width 4096 | Out-File -FilePath $out -Append -Encoding UTF8
+            $allAttrs | Export-Csv -Path $smartCsv -Encoding UTF8 -NoTypeInformation
+        }
+
+        Append-Text $out "`r`n=== DISK PERFORMANCE CURRENT QUEUE ==="
+        $logicalPerf = Get-CimSafe -ClassName Win32_PerfFormattedData_PerfDisk_LogicalDisk
+        Export-Object $logicalPerf $out (Join-Path $Script:CsvPath "LogicalDisk_Performance_Current.csv")
+
+        $physicalPerf = Get-CimSafe -ClassName Win32_PerfFormattedData_PerfDisk_PhysicalDisk
+        Export-Object $physicalPerf $out (Join-Path $Script:CsvPath "PhysicalDisk_Performance_Current.csv")
+
+        Append-Text $out "`r`n=== FSUTIL DIRTY QUERY ==="
+        if ($logical) {
+            foreach ($vol in $logical) {
+                if ($vol.DriveType -eq 3 -and $vol.DeviceID) {
+                    Invoke-CommandSafe -FilePath "cmd.exe" -Arguments "/c fsutil dirty query $($vol.DeviceID)" -OutputFile $out -TimeoutSeconds 60
+                }
+            }
+        }
+
+        Append-Text $out "`r`n=== CHKDSK READ-ONLY SCAN ==="
+        if ($logical) {
+            foreach ($vol in $logical) {
+                if ($vol.DriveType -eq 3 -and $vol.DeviceID) {
+                    Invoke-CommandSafe -FilePath "cmd.exe" -Arguments "/c chkdsk $($vol.DeviceID)" -OutputFile (Join-Path $Script:ReportsPath ("CHKDSK_{0}.txt" -f ($vol.DeviceID -replace ":", ""))) -TimeoutSeconds 1800
+                }
+            }
+        }
+
+        Collect-DiskEvents
+        Run-WinSATDiskTests
+    }
+    catch {
+        Write-Log "Collect-DiskInformation failed: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Collect-DiskEvents {
+    $out = Join-Path $Script:ReportsPath "02A_Disk_Related_Events.txt"
+
+    try {
+        Append-Text $out "=== DISK / NTFS / STORAHCI / ATAPI EVENTS ==="
+
+        $providers = @("disk", "Disk", "Ntfs", "Microsoft-Windows-Ntfs", "storahci", "atapi", "iaStorA", "iaStorAV", "stornvme", "volmgr", "volsnap", "partmgr")
+        foreach ($provider in $providers) {
+            try {
+                Append-Text $out "`r`n=== Provider: $provider ==="
+                $events = Get-WinEvent -FilterHashtable @{ LogName = "System"; ProviderName = $provider } -MaxEvents 300 -ErrorAction Stop
+                $events | Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message |
+                    Format-List * | Out-File -FilePath $out -Encoding UTF8 -Append -Width 4096
+
+                if ($provider -match "disk") {
+                    $Script:Metrics.DiskErrorCount += ($events | Where-Object { $_.LevelDisplayName -match "Error|Critical|Ошибка|Критический" }).Count
+                }
+
+                if ($provider -match "ntfs") {
+                    $Script:Metrics.NtfsErrorCount += ($events | Where-Object { $_.LevelDisplayName -match "Error|Critical|Ошибка|Критический" }).Count
+                }
+            }
+            catch {
+                Append-Text $out "Provider $provider unavailable or no events: $($_.Exception.Message)"
+            }
+        }
+
+        if ($Script:Metrics.DiskErrorCount -gt 0) {
+            Add-Finding "CRITICAL" "Disk Events" "В журнале System найдены ошибки Disk: $($Script:Metrics.DiskErrorCount)." "Проверить SMART, кабель/разъем, выполнить резервное копирование. При SMART-проблемах заменить диск."
+        }
+
+        if ($Script:Metrics.NtfsErrorCount -gt 0) {
+            Add-Finding "WARN" "NTFS Events" "В журнале System найдены ошибки NTFS: $($Script:Metrics.NtfsErrorCount)." "Проверить файловую систему, выполнить chkdsk, проверить состояние накопителя."
+        }
+    }
+    catch {
+        Write-Log "Collect-DiskEvents failed: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Run-WinSATDiskTests {
+    $out = Join-Path $Script:ReportsPath "02B_WinSAT_Disk.txt"
+
+    try {
+        Append-Text $out "=== WINSAT DISK TESTS ==="
+        $logical = Get-CimSafe -ClassName Win32_LogicalDisk
+
+        if ($logical) {
+            foreach ($vol in $logical) {
+                if ($vol.DriveType -eq 3 -and $vol.DeviceID) {
+                    $letter = $vol.DeviceID.Replace(":", "")
+                    Append-Text $out "`r`n=== WinSAT disk test for $($vol.DeviceID) ==="
+                    Invoke-CommandSafe -FilePath "winsat.exe" -Arguments "disk -drive $letter" -OutputFile $out -TimeoutSeconds 1200
+                }
+            }
+        }
+    }
+    catch {
+        Write-Log "Run-WinSATDiskTests failed: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Collect-MemoryInformation {
+    Write-Host "Collecting memory information..."
+
+    $out = Join-Path $Script:ReportsPath "03_Memory.txt"
+
+    try {
+        Append-Text $out "=== PHYSICAL MEMORY MODULES ==="
+        $physical = Get-CimSafe -ClassName Win32_PhysicalMemory
+        Export-Object $physical $out (Join-Path $Script:CsvPath "Memory_Physical_Modules.csv")
+
+        Append-Text $out "`r`n=== OPERATING SYSTEM MEMORY ==="
+        $os = Get-CimSafe -ClassName Win32_OperatingSystem
+        Export-Object $os $out
+
+        if ($os) {
+            $totalMB = [math]::Round($os.TotalVisibleMemorySize / 1024, 2)
+            $freeMB = [math]::Round($os.FreePhysicalMemory / 1024, 2)
+            $freePercent = 0
+            if ($totalMB -gt 0) {
+                $freePercent = [math]::Round(($freeMB / $totalMB) * 100, 2)
+            }
+
+            Append-Text $out "`r`nTotal RAM MB: $totalMB"
+            Append-Text $out "Free RAM MB: $freeMB"
+            Append-Text $out "Free RAM Percent: $freePercent"
+
+            if ($totalMB -lt 4096) {
+                Add-Finding "WARN" "Memory" "Оперативной памяти меньше 4 ГБ: $totalMB МБ." "Для Windows 10/11 желательно минимум 8 ГБ, для старого офисного ПК минимум 4 ГБ."
+            }
+
+            if ($freePercent -lt 10) {
+                Add-Finding "WARN" "Memory" "Свободной RAM меньше 10%: $freePercent%." "Закрыть лишние программы, проверить автозагрузку, рассмотреть увеличение RAM."
+            }
+        }
+
+        Append-Text $out "`r`n=== PAGEFILE ==="
+        $page = Get-CimSafe -ClassName Win32_PageFileUsage
+        Export-Object $page $out (Join-Path $Script:CsvPath "Pagefile_Usage.csv")
+
+        Append-Text $out "`r`n=== PAGEFILE SETTINGS ==="
+        $pageSettings = Get-CimSafe -ClassName Win32_PageFileSetting
+        Export-Object $pageSettings $out (Join-Path $Script:CsvPath "Pagefile_Settings.csv")
+
+        Append-Text $out "`r`n=== PERFORMANCE MEMORY ==="
+        $memPerf = Get-CimSafe -ClassName Win32_PerfFormattedData_PerfOS_Memory
+        Export-Object $memPerf $out (Join-Path $Script:CsvPath "Memory_Performance_Current.csv")
+
+        Append-Text $out "`r`n=== SYSTEM PERFORMANCE ==="
+        $sysPerf = Get-CimSafe -ClassName Win32_PerfFormattedData_PerfOS_System
+        Export-Object $sysPerf $out (Join-Path $Script:CsvPath "System_Performance_Current.csv")
+
+        Append-Text $out "`r`n=== VM / COMMIT INFORMATION ==="
+        if ($memPerf) {
+            Append-Text $out ("Available MBytes: {0}" -f $memPerf.AvailableMBytes)
+            Append-Text $out ("Committed Bytes: {0}" -f $memPerf.CommittedBytes)
+            Append-Text $out ("Commit Limit: {0}" -f $memPerf.CommitLimit)
+            Append-Text $out ("Pages/sec: {0}" -f $memPerf.PagesPersec)
+            Append-Text $out ("Page Reads/sec: {0}" -f $memPerf.PageReadsPersec)
+            Append-Text $out ("Cache Bytes: {0}" -f $memPerf.CacheBytes)
+        }
+
+        Append-Text $out "`r`n=== STANDBY / CACHE NOTE ==="
+        Append-Text $out "Windows does not expose detailed standby list breakdown through a stable built-in PowerShell 5.1 command on all supported OS versions. CacheBytes and memory performance counters are collected above."
+    }
+    catch {
+        Write-Log "Collect-MemoryInformation failed: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Monitor-Performance {
+    Write-Host "Monitoring performance for 60 seconds..."
+
+    $csv = Join-Path $Script:CsvPath "Performance_60s.csv"
+    $out = Join-Path $Script:ReportsPath "04_Performance_Monitoring.txt"
+
+    $samples = @()
+
+    try {
+        for ($i = 1; $i -le 60; $i++) {
+            $time = Get-Date
+
+            $cpu = Get-CimSafe -ClassName Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'"
+            $mem = Get-CimSafe -ClassName Win32_PerfFormattedData_PerfOS_Memory
+            $disk = Get-CimSafe -ClassName Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name='_Total'"
+            $net = Get-CimSafe -ClassName Win32_PerfFormattedData_Tcpip_NetworkInterface
+            $sys = Get-CimSafe -ClassName Win32_PerfFormattedData_PerfOS_System
+
+            $netBytes = 0
+            $netPackets = 0
+            if ($net) {
+                foreach ($n in $net) {
+                    $netBytes += [double]$n.BytesTotalPersec
+                    $netPackets += [double]$n.PacketsPersec
+                }
+            }
+
+            $obj = New-Object PSObject -Property @{
+                Timestamp = $time.ToString("yyyy-MM-dd HH:mm:ss")
+                Sample = $i
+                CPU_Percent = if ($cpu) { [double]$cpu.PercentProcessorTime } else { $null }
+                CPU_InterruptPercent = if ($cpu) { [double]$cpu.PercentInterruptTime } else { $null }
+                CPU_DPCPercent = if ($cpu) { [double]$cpu.PercentDPCTime } else { $null }
+                InterruptsPerSec = if ($cpu) { [double]$cpu.InterruptsPersec } else { $null }
+                DPCsQueuedPerSec = if ($cpu) { [double]$cpu.DPCsQueuedPersec } else { $null }
+                RAM_AvailableMB = if ($mem) { [double]$mem.AvailableMBytes } else { $null }
+                RAM_PagesPerSec = if ($mem) { [double]$mem.PagesPersec } else { $null }
+                RAM_CommittedGB = if ($mem) { [math]::Round(([double]$mem.CommittedBytes / 1GB), 2) } else { $null }
+                RAM_CommitLimitGB = if ($mem) { [math]::Round(([double]$mem.CommitLimit / 1GB), 2) } else { $null }
+                Disk_PercentTime = if ($disk) { [double]$disk.PercentDiskTime } else { $null }
+                Disk_QueueLength = if ($disk) { [double]$disk.CurrentDiskQueueLength } else { $null }
+                Disk_ReadMBps = if ($disk) { [math]::Round(([double]$disk.DiskReadBytesPersec / 1MB), 2) } else { $null }
+                Disk_WriteMBps = if ($disk) { [math]::Round(([double]$disk.DiskWriteBytesPersec / 1MB), 2) } else { $null }
+                Disk_TransfersPerSec = if ($disk) { [double]$disk.DiskTransfersPersec } else { $null }
+                Network_MBps = [math]::Round(($netBytes / 1MB), 2)
+                Network_PacketsPerSec = $netPackets
+                ContextSwitchesPerSec = if ($sys) { [double]$sys.ContextSwitchesPersec } else { $null }
+                SystemCallsPerSec = if ($sys) { [double]$sys.SystemCallsPersec } else { $null }
+                ProcessorQueueLength = if ($sys) { [double]$sys.ProcessorQueueLength } else { $null }
+            }
+
+            $samples += $obj
+            Start-Sleep -Seconds 1
+        }
+
+        $samples | Export-Csv -Path $csv -Encoding UTF8 -NoTypeInformation
+        $samples | Format-Table -AutoSize | Out-String -Width 4096 | Out-File -FilePath $out -Encoding UTF8
+
+        $cpuValues = $samples | Where-Object { $null -ne $_.CPU_Percent } | Select-Object -ExpandProperty CPU_Percent
+        $ramValues = $samples | Where-Object { $null -ne $_.RAM_AvailableMB } | Select-Object -ExpandProperty RAM_AvailableMB
+        $queueValues = $samples | Where-Object { $null -ne $_.Disk_QueueLength } | Select-Object -ExpandProperty Disk_QueueLength
+        $readValues = $samples | Where-Object { $null -ne $_.Disk_ReadMBps } | Select-Object -ExpandProperty Disk_ReadMBps
+        $writeValues = $samples | Where-Object { $null -ne $_.Disk_WriteMBps } | Select-Object -ExpandProperty Disk_WriteMBps
+
+        if ($cpuValues.Count -gt 0) {
+            $Script:Metrics.AvgCpu = [math]::Round(($cpuValues | Measure-Object -Average).Average, 2)
+            $Script:Metrics.MaxCpu = [math]::Round(($cpuValues | Measure-Object -Maximum).Maximum, 2)
+        }
+
+        if ($ramValues.Count -gt 0) {
+            $Script:Metrics.AvgAvailableMemoryMB = [math]::Round(($ramValues | Measure-Object -Average).Average, 2)
+            $Script:Metrics.MinAvailableMemoryMB = [math]::Round(($ramValues | Measure-Object -Minimum).Minimum, 2)
+        }
+
+        if ($queueValues.Count -gt 0) {
+            $Script:Metrics.AvgDiskQueue = [math]::Round(($queueValues | Measure-Object -Average).Average, 2)
+            $Script:Metrics.MaxDiskQueue = [math]::Round(($queueValues | Measure-Object -Maximum).Maximum, 2)
+        }
+
+        if ($readValues.Count -gt 0) {
+            $Script:Metrics.AvgDiskReadMBs = [math]::Round(($readValues | Measure-Object -Average).Average, 2)
+        }
+
+        if ($writeValues.Count -gt 0) {
+            $Script:Metrics.AvgDiskWriteMBs = [math]::Round(($writeValues | Measure-Object -Average).Average, 2)
+        }
+
+        if ($Script:Metrics.AvgCpu -ne $null -and $Script:Metrics.AvgCpu -gt 80) {
+            Add-Finding "WARN" "CPU" "Средняя загрузка CPU за 60 секунд высокая: $($Script:Metrics.AvgCpu)%." "Проверить TOP процессов по CPU и автозагрузку."
+        }
+
+        if ($Script:Metrics.MinAvailableMemoryMB -ne $null -and $Script:Metrics.MinAvailableMemoryMB -lt 512) {
+            Add-Finding "WARN" "Memory" "Минимально доступная RAM за мониторинг меньше 512 МБ: $($Script:Metrics.MinAvailableMemoryMB) МБ." "Закрыть лишние приложения, проверить автозагрузку, увеличить RAM."
+        }
+
+        if ($Script:Metrics.AvgDiskQueue -ne $null -and $Script:Metrics.AvgDiskQueue -gt 2) {
+            Add-Finding "WARN" "Disk Performance" "Средняя очередь диска высокая: $($Script:Metrics.AvgDiskQueue)." "Проверить SMART, ошибки Disk/NTFS, процессы с высоким IO. Для HDD заменить на SSD."
+        }
+
+        if ($Script:Metrics.MaxDiskQueue -ne $null -and $Script:Metrics.MaxDiskQueue -gt 10) {
+            Add-Finding "CRITICAL" "Disk Performance" "Максимальная очередь диска очень высокая: $($Script:Metrics.MaxDiskQueue)." "Проверить накопитель. Если HDD старый или SMART плохой — заменить."
+        }
+    }
+    catch {
+        Write-Log "Monitor-Performance failed: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Collect-Processes {
+    Write-Host "Collecting process information..."
+
+    $out = Join-Path $Script:ReportsPath "05_Processes.txt"
+
+    try {
+        Append-Text $out "=== ALL PROCESSES ==="
+        $procs = Get-Process -ErrorAction SilentlyContinue | Select-Object `
+            Name, Id, CPU, WorkingSet64, PrivateMemorySize64, VirtualMemorySize64, Handles, Threads, StartTime, Path, Company, ProductVersion
+
+        $procs | Export-Csv -Path (Join-Path $Script:CsvPath "Processes_All.csv") -Encoding UTF8 -NoTypeInformation
+        $procs | Format-Table -AutoSize | Out-String -Width 4096 | Out-File -FilePath $out -Encoding UTF8 -Append
+
+        Append-Text $out "`r`n=== TOP 100 BY CPU TOTAL ==="
+        $topCpu = $procs | Sort-Object CPU -Descending | Select-Object -First 100
+        $topCpu | Format-Table -AutoSize | Out-String -Width 4096 | Out-File $out -Append -Encoding UTF8
+        $topCpu | Export-Csv -Path (Join-Path $Script:CsvPath "Processes_Top_CPU.csv") -Encoding UTF8 -NoTypeInformation
+
+        Append-Text $out "`r`n=== TOP 100 BY RAM ==="
+        $topRam = $procs | Sort-Object WorkingSet64 -Descending | Select-Object -First 100
+        $topRam | Format-Table -AutoSize | Out-String -Width 4096 | Out-File $out -Append -Encoding UTF8
+        $topRam | Export-Csv -Path (Join-Path $Script:CsvPath "Processes_Top_RAM.csv") -Encoding UTF8 -NoTypeInformation
+
+        Append-Text $out "`r`n=== TOP 100 BY HANDLES ==="
+        $topHandles = $procs | Sort-Object Handles -Descending | Select-Object -First 100
+        $topHandles | Format-Table -AutoSize | Out-String -Width 4096 | Out-File $out -Append -Encoding UTF8
+        $topHandles | Export-Csv -Path (Join-Path $Script:CsvPath "Processes_Top_Handles.csv") -Encoding UTF8 -NoTypeInformation
+
+        Append-Text $out "`r`n=== TOP 100 BY THREADS ==="
+        $topThreads = $procs | Sort-Object { if ($_.Threads) { $_.Threads.Count } else { 0 } } -Descending | Select-Object -First 100
+        $topThreads | Format-Table -AutoSize | Out-String -Width 4096 | Out-File $out -Append -Encoding UTF8
+        $topThreads | Export-Csv -Path (Join-Path $Script:CsvPath "Processes_Top_Threads.csv") -Encoding UTF8 -NoTypeInformation
+
+        Append-Text $out "`r`n=== TOP 100 BY UPTIME ==="
+        $now = Get-Date
+        $uptimeObjects = @()
+        foreach ($p in $procs) {
+            try {
+                if ($p.StartTime) {
+                    $uptimeObjects += New-Object PSObject -Property @{
+                        Name = $p.Name
+                        Id = $p.Id
+                        StartTime = $p.StartTime
+                        UptimeHours = [math]::Round((New-TimeSpan -Start $p.StartTime -End $now).TotalHours, 2)
+                        Path = $p.Path
+                    }
+                }
+            }
+            catch {
+            }
+        }
+        $topUptime = $uptimeObjects | Sort-Object UptimeHours -Descending | Select-Object -First 100
+        $topUptime | Format-Table -AutoSize | Out-String -Width 4096 | Out-File $out -Append -Encoding UTF8
+        $topUptime | Export-Csv -Path (Join-Path $Script:CsvPath "Processes_Top_Uptime.csv") -Encoding UTF8 -NoTypeInformation
+
+        Append-Text $out "`r`n=== PROCESS PERF COUNTERS ==="
+        $perf = Get-CimSafe -ClassName Win32_PerfFormattedData_PerfProc_Process
+        Export-Object $perf $out (Join-Path $Script:CsvPath "Processes_PerfCounters.csv")
+
+        if ($perf) {
+            Append-Text $out "`r`n=== TOP 100 BY CURRENT CPU PERCENT ==="
+            $perfTopCpu = $perf | Where-Object { $_.Name -ne "_Total" -and $_.Name -ne "Idle" } | Sort-Object PercentProcessorTime -Descending | Select-Object -First 100
+            $perfTopCpu | Select-Object Name, IDProcess, PercentProcessorTime, WorkingSetPrivate, IOReadBytesPersec, IOWriteBytesPersec, HandleCount, ThreadCount, PageFaultsPersec |
+                Format-Table -AutoSize | Out-String -Width 4096 | Out-File $out -Append -Encoding UTF8
+            $perfTopCpu | Export-Csv -Path (Join-Path $Script:CsvPath "Processes_Top_CurrentCPU.csv") -Encoding UTF8 -NoTypeInformation
+
+            Append-Text $out "`r`n=== TOP 100 BY DISK IO BYTES/SEC ==="
+            $perfTopIo = $perf | Where-Object { $_.Name -ne "_Total" -and $_.Name -ne "Idle" } |
+                Select-Object Name, IDProcess, PercentProcessorTime, WorkingSetPrivate, IOReadBytesPersec, IOWriteBytesPersec, IODataBytesPersec, HandleCount, ThreadCount, PageFaultsPersec |
+                Sort-Object IODataBytesPersec -Descending |
+                Select-Object -First 100
+
+            $perfTopIo | Format-Table -AutoSize | Out-String -Width 4096 | Out-File $out -Append -Encoding UTF8
+            $perfTopIo | Export-Csv -Path (Join-Path $Script:CsvPath "Processes_Top_DiskIO.csv") -Encoding UTF8 -NoTypeInformation
+
+            Append-Text $out "`r`n=== TOP 100 BY PAGE FAULTS ==="
+            $perfTopFaults = $perf | Where-Object { $_.Name -ne "_Total" -and $_.Name -ne "Idle" } | Sort-Object PageFaultsPersec -Descending | Select-Object -First 100
+            $perfTopFaults | Select-Object Name, IDProcess, PageFaultsPersec, PercentProcessorTime, WorkingSetPrivate |
+                Format-Table -AutoSize | Out-String -Width 4096 | Out-File $out -Append -Encoding UTF8
+            $perfTopFaults | Export-Csv -Path (Join-Path $Script:CsvPath "Processes_Top_PageFaults.csv") -Encoding UTF8 -NoTypeInformation
+
+            $def = $perf | Where-Object { $_.Name -match "MsMpEng|Antimalware" } | Sort-Object PercentProcessorTime -Descending | Select-Object -First 1
+            if ($def) {
+                $Script:Metrics.DefenderCpu = [double]$def.PercentProcessorTime
+                if ($Script:Metrics.DefenderCpu -gt 20) {
+                    Add-Finding "INFO" "Defender" "Windows Defender/MsMpEng сейчас заметно использует CPU: $($Script:Metrics.DefenderCpu)%." "Если ПК тормозит во время проверки, дождаться окончания или настроить расписание проверки."
+                }
+            }
+
+            $chrome = $perf | Where-Object { $_.Name -match "chrome|msedge|firefox|browser" } | Measure-Object -Property PercentProcessorTime -Sum
+            if ($chrome -and $chrome.Sum -gt 30) {
+                $Script:Metrics.ChromeCpu = [double]$chrome.Sum
+                Add-Finding "INFO" "Browser" "Браузеры суммарно используют CPU около $($Script:Metrics.ChromeCpu)%." "Проверить вкладки, расширения, автозапуск браузера."
+            }
+        }
+
+        Append-Text $out "`r`n=== OPEN FILES BUILT-IN CHECK ==="
+        Append-Text $out "Per-process complete open-file enumeration is not available with only standard Windows built-in tools on every Windows version. Trying built-in openfiles.exe."
+        Invoke-CommandSafe -FilePath "cmd.exe" -Arguments "/c openfiles /query /fo csv /v" -OutputFile (Join-Path $Script:ReportsPath "05A_OpenFiles_Openfiles.txt") -TimeoutSeconds 120
+        Invoke-CommandSafe -FilePath "cmd.exe" -Arguments "/c net file" -OutputFile (Join-Path $Script:ReportsPath "05B_OpenFiles_NetFile.txt") -TimeoutSeconds 120
+    }
+    catch {
+        Write-Log "Collect-Processes failed: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Collect-Startup {
+    Write-Host "Collecting startup information..."
+
+    $out = Join-Path $Script:ReportsPath "06_Startup.txt"
+
+    try {
+        Append-Text $out "=== REGISTRY RUN / RUNONCE ==="
+
+        $regPaths = @(
+            "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run",
+            "HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce",
+            "HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run",
+            "HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\RunOnce",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce"
+        )
+
+        $startupItems = @()
+
+        foreach ($path in $regPaths) {
+            try {
+                Append-Text $out "`r`n--- $path ---"
+                if (Test-Path $path) {
+                    $props = Get-ItemProperty -Path $path -ErrorAction Stop
+                    $props.PSObject.Properties | Where-Object { $_.Name -notmatch "^PS" } | ForEach-Object {
+                        $startupItems += New-Object PSObject -Property @{
+                            Source = $path
+                            Name = $_.Name
+                            Command = $_.Value
+                        }
+                    }
+                    $props | Format-List * | Out-File $out -Append -Encoding UTF8 -Width 4096
+                }
+                else {
+                    Append-Text $out "Path not found."
+                }
+            }
+            catch {
+                Write-Log "Startup registry path failed $path : $($_.Exception.Message)" "ERROR"
+            }
+        }
+
+        Append-Text $out "`r`n=== STARTUP FOLDERS ==="
+        $startupFolders = @(
+            [Environment]::GetFolderPath("Startup"),
+            "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"
+        )
+
+        foreach ($folder in $startupFolders) {
+            try {
+                Append-Text $out "`r`n--- $folder ---"
+                if (Test-Path $folder) {
+                    $items = Get-ChildItem -Path $folder -Force -ErrorAction Stop
+                    $items | Format-List * | Out-File $out -Append -Encoding UTF8 -Width 4096
+                    foreach ($item in $items) {
+                        $startupItems += New-Object PSObject -Property @{
+                            Source = $folder
+                            Name = $item.Name
+                            Command = $item.FullName
+                        }
+                    }
+                }
+            }
+            catch {
+                Write-Log "Startup folder failed $folder : $($_.Exception.Message)" "ERROR"
+            }
+        }
+
+        Append-Text $out "`r`n=== WMI STARTUP COMMAND ==="
+        $wmiStartup = Get-CimSafe -ClassName Win32_StartupCommand
+        Export-Object $wmiStartup $out (Join-Path $Script:CsvPath "Startup_WMI.csv")
+
+        if ($wmiStartup) {
+            foreach ($item in $wmiStartup) {
+                $startupItems += New-Object PSObject -Property @{
+                    Source = $item.Location
+                    Name = $item.Name
+                    Command = $item.Command
+                }
+            }
+        }
+
+        Append-Text $out "`r`n=== TASK SCHEDULER ==="
+        try {
+            $tasks = Get-ScheduledTask -ErrorAction Stop
+            $tasks | Select-Object TaskName, TaskPath, State, Author, Description |
+                Export-Csv -Path (Join-Path $Script:CsvPath "Scheduled_Tasks.csv") -Encoding UTF8 -NoTypeInformation
+            $tasks | Select-Object TaskName, TaskPath, State, Author, Description |
+                Format-Table -AutoSize | Out-String -Width 4096 | Out-File $out -Append -Encoding UTF8
+        }
+        catch {
+            Append-Text $out "Get-ScheduledTask unavailable, using schtasks.exe."
+            Invoke-CommandSafe -FilePath "cmd.exe" -Arguments "/c schtasks /query /fo LIST /v" -OutputFile (Join-Path $Script:ReportsPath "06A_ScheduledTasks_schtasks.txt") -TimeoutSeconds 300
+        }
+
+        Append-Text $out "`r`n=== SERVICES AUTO START ==="
+        $services = Get-CimSafe -ClassName Win32_Service
+        if ($services) {
+            $autoServices = $services | Where-Object { $_.StartMode -eq "Auto" -or $_.StartMode -eq "Automatic" }
+            $autoServices | Select-Object Name, DisplayName, State, StartMode, StartName, PathName |
+                Export-Csv -Path (Join-Path $Script:CsvPath "Startup_AutoServices.csv") -Encoding UTF8 -NoTypeInformation
+            $autoServices | Select-Object Name, DisplayName, State, StartMode, StartName, PathName |
+                Format-Table -AutoSize | Out-String -Width 4096 | Out-File $out -Append -Encoding UTF8
+        }
+
+        Append-Text $out "`r`n=== DRIVERS AUTO / BOOT / SYSTEM START ==="
+        $drivers = Get-CimSafe -ClassName Win32_SystemDriver
+        if ($drivers) {
+            $autoDrivers = $drivers | Where-Object { $_.StartMode -match "Auto|Boot|System" }
+            $autoDrivers | Select-Object Name, DisplayName, State, StartMode, PathName |
+                Export-Csv -Path (Join-Path $Script:CsvPath "Startup_Drivers.csv") -Encoding UTF8 -NoTypeInformation
+            $autoDrivers | Select-Object Name, DisplayName, State, StartMode, PathName |
+                Format-Table -AutoSize | Out-String -Width 4096 | Out-File $out -Append -Encoding UTF8
+        }
+
+        Append-Text $out "`r`n=== EXPLORER SHELL ==="
+        $shellPaths = @(
+            "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon",
+            "HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+        )
+
+        foreach ($path in $shellPaths) {
+            try {
+                Append-Text $out "`r`n--- $path ---"
+                if (Test-Path $path) {
+                    Get-ItemProperty -Path $path | Format-List Shell, Userinit, VMApplet, Taskman | Out-File $out -Append -Encoding UTF8 -Width 4096
+                }
+            }
+            catch {
+                Write-Log "Explorer shell registry failed: $($_.Exception.Message)" "ERROR"
+            }
+        }
+
+        $startupItems | Export-Csv -Path (Join-Path $Script:CsvPath "Startup_All_Collected.csv") -Encoding UTF8 -NoTypeInformation
+        $Script:Metrics.StartupCount = ($startupItems | Measure-Object).Count
+
+        if ($Script:Metrics.StartupCount -gt 25) {
+            Add-Finding "INFO" "Startup" "Обнаружено много элементов автозагрузки: $($Script:Metrics.StartupCount)." "Отключить лишнее в автозагрузке, особенно апдейтеры, мессенджеры и ненужные фоновые приложения."
+        }
+    }
+    catch {
+        Write-Log "Collect-Startup failed: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Collect-Services {
+    Write-Host "Collecting services..."
+
+    $out = Join-Path $Script:ReportsPath "07_Services.txt"
+
+    try {
+        $services = Get-CimSafe -ClassName Win32_Service
+
+        Append-Text $out "=== ALL SERVICES ==="
+        Export-Object $services $out (Join-Path $Script:CsvPath "Services_All.csv")
+
+        if ($services) {
+            Append-Text $out "`r`n=== RUNNING SERVICES ==="
+            $running = $services | Where-Object { $_.State -eq "Running" }
+            $running | Select-Object Name, DisplayName, State, StartMode, StartName, PathName |
+                Format-Table -AutoSize | Out-String -Width 4096 | Out-File $out -Append -Encoding UTF8
+            $running | Export-Csv -Path (Join-Path $Script:CsvPath "Services_Running.csv") -Encoding UTF8 -NoTypeInformation
+
+            Append-Text $out "`r`n=== DISABLED SERVICES ==="
+            $disabled = $services | Where-Object { $_.StartMode -eq "Disabled" }
+            $disabled | Select-Object Name, DisplayName, State, StartMode, StartName, PathName |
+                Format-Table -AutoSize | Out-String -Width 4096 | Out-File $out -Append -Encoding UTF8
+            $disabled | Export-Csv -Path (Join-Path $Script:CsvPath "Services_Disabled.csv") -Encoding UTF8 -NoTypeInformation
+
+            Append-Text $out "`r`n=== POSSIBLE THIRD-PARTY SERVICES ==="
+            $third = $services | Where-Object {
+                $_.PathName -and
+                $_.PathName -notmatch "\\Windows\\System32" -and
+                $_.PathName -notmatch "\\Windows\\SysWOW64" -and
+                $_.PathName -notmatch "^C:\\Windows\\"
+            }
+            $third | Select-Object Name, DisplayName, State, StartMode, StartName, PathName |
+                Format-Table -AutoSize | Out-String -Width 4096 | Out-File $out -Append -Encoding UTF8
+            $third | Export-Csv -Path (Join-Path $Script:CsvPath "Services_Possible_ThirdParty.csv") -Encoding UTF8 -NoTypeInformation
+        }
+
+        Append-Text $out "`r`n=== SC QUERY ALL ==="
+        Invoke-CommandSafe -FilePath "cmd.exe" -Arguments "/c sc query type= service state= all" -OutputFile (Join-Path $Script:ReportsPath "07A_SC_Query_All.txt") -TimeoutSeconds 300
+    }
+    catch {
+        Write-Log "Collect-Services failed: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Collect-Drivers {
+    Write-Host "Collecting drivers..."
+
+    $out = Join-Path $Script:ReportsPath "08_Drivers.txt"
+
+    try {
+        Append-Text $out "=== WIN32 SYSTEM DRIVERS ==="
+        $drivers = Get-CimSafe -ClassName Win32_SystemDriver
+        Export-Object $drivers $out (Join-Path $Script:CsvPath "Drivers_System.csv")
+
+        Append-Text $out "`r`n=== PNP SIGNED DRIVERS ==="
+        $signed = Get-CimSafe -ClassName Win32_PnPSignedDriver
+        Export-Object $signed $out (Join-Path $Script:CsvPath "Drivers_PnPSigned.csv")
+
+        if ($signed) {
+            Append-Text $out "`r`n=== UNSIGNED OR UNKNOWN SIGNATURE DRIVERS ==="
+            $unsigned = $signed | Where-Object {
+                ($_.IsSigned -eq $false) -or
+                ($_.Signer -eq $null) -or
+                ($_.Signer -eq "")
+            }
+
+            $Script:Metrics.UnsignedDriverCount = ($unsigned | Measure-Object).Count
+            $unsigned | Select-Object DeviceName, Manufacturer, DriverVersion, DriverDate, IsSigned, Signer, InfName |
+                Format-Table -AutoSize | Out-String -Width 4096 | Out-File $out -Append -Encoding UTF8
+            $unsigned | Export-Csv -Path (Join-Path $Script:CsvPath "Drivers_Unsigned_Unknown.csv") -Encoding UTF8 -NoTypeInformation
+
+            if ($Script:Metrics.UnsignedDriverCount -gt 0) {
+                Add-Finding "WARN" "Drivers" "Обнаружены неподписанные или неизвестно подписанные драйверы: $($Script:Metrics.UnsignedDriverCount)." "Проверить драйверы, особенно сетевые, дисковые, антивирусные и старые устройства."
+            }
+
+            Append-Text $out "`r`n=== OLD DRIVERS OLDER THAN 5 YEARS ==="
+            $limit = (Get-Date).AddYears(-5)
+            $oldDrivers = @()
+            foreach ($d in $signed) {
+                try {
+                    if ($d.DriverDate) {
+                        $dt = [System.Management.ManagementDateTimeConverter]::ToDateTime($d.DriverDate)
+                        if ($dt -lt $limit) {
+                            $oldDrivers += New-Object PSObject -Property @{
+                                DeviceName = $d.DeviceName
+                                Manufacturer = $d.Manufacturer
+                                DriverVersion = $d.DriverVersion
+                                DriverDate = $dt
+                                IsSigned = $d.IsSigned
+                                Signer = $d.Signer
+                                InfName = $d.InfName
+                            }
+                        }
+                    }
+                }
+                catch {
+                }
+            }
+
+            $oldDrivers | Sort-Object DriverDate | Format-Table -AutoSize | Out-String -Width 4096 | Out-File $out -Append -Encoding UTF8
+            $oldDrivers | Export-Csv -Path (Join-Path $Script:CsvPath "Drivers_Older_Than_5_Years.csv") -Encoding UTF8 -NoTypeInformation
+        }
+
+        Append-Text $out "`r`n=== DRIVERQUERY ==="
+        Invoke-CommandSafe -FilePath "cmd.exe" -Arguments "/c driverquery /v /fo csv" -OutputFile (Join-Path $Script:ReportsPath "08A_DriverQuery.csv.txt") -TimeoutSeconds 300
+
+        Append-Text $out "`r`n=== PNP DEVICES WITH ERROR ==="
+        $pnp = Get-CimSafe -ClassName Win32_PnPEntity
+        if ($pnp) {
+            $badPnp = $pnp | Where-Object { $_.ConfigManagerErrorCode -ne 0 }
+            $badPnp | Select-Object Name, Manufacturer, PNPDeviceID, ConfigManagerErrorCode, Status |
+                Format-Table -AutoSize | Out-String -Width 4096 | Out-File $out -Append -Encoding UTF8
+            $badPnp | Export-Csv -Path (Join-Path $Script:CsvPath "PNP_Devices_With_Errors.csv") -Encoding UTF8 -NoTypeInformation
+
+            if (($badPnp | Measure-Object).Count -gt 0) {
+                Add-Finding "WARN" "Devices" "Есть устройства с ошибками в диспетчере устройств: $(($badPnp | Measure-Object).Count)." "Открыть Диспетчер устройств и проверить устройства с ошибками."
+            }
+        }
+    }
+    catch {
+        Write-Log "Collect-Drivers failed: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Collect-WindowsEvents {
+    Write-Host "Collecting Windows event logs..."
+
+    $out = Join-Path $Script:ReportsPath "09_Windows_Events.txt"
+
+    try {
+        $logs = @("System", "Application", "Security")
+
+        foreach ($log in $logs) {
+            try {
+                Append-Text $out "`r`n=== LOG: $log LAST 1000 ==="
+                $events = Get-WinEvent -LogName $log -MaxEvents 1000 -ErrorAction Stop
+                $events | Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message |
+                    Format-List * | Out-File -FilePath $out -Encoding UTF8 -Append -Width 4096
+                $events | Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message |
+                    Export-Csv -Path (Join-Path $Script:CsvPath ("Events_{0}.csv" -f $log)) -Encoding UTF8 -NoTypeInformation
+            }
+            catch {
+                Append-Text $out "Cannot read log $log : $($_.Exception.Message)"
+                Write-Log "Cannot read event log $log : $($_.Exception.Message)" "ERROR"
+            }
+        }
+
+        $providerChecks = @(
+            @{ Name = "Kernel-Power"; Provider = "Microsoft-Windows-Kernel-Power"; Log = "System"; Csv = "Events_KernelPower.csv" },
+            @{ Name = "Disk"; Provider = "disk"; Log = "System"; Csv = "Events_Disk.csv" },
+            @{ Name = "Ntfs"; Provider = "Ntfs"; Log = "System"; Csv = "Events_Ntfs.csv" },
+            @{ Name = "WHEA"; Provider = "Microsoft-Windows-WHEA-Logger"; Log = "System"; Csv = "Events_WHEA.csv" },
+            @{ Name = "BugCheck"; Provider = "Microsoft-Windows-WER-SystemErrorReporting"; Log = "System"; Csv = "Events_BugCheck.csv" }
+        )
+
+        foreach ($check in $providerChecks) {
+            try {
+                Append-Text $out "`r`n=== PROVIDER: $($check.Name) LAST 1000 ==="
+                $events = Get-WinEvent -FilterHashtable @{ LogName = $check.Log; ProviderName = $check.Provider } -MaxEvents 1000 -ErrorAction Stop
+                $events | Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message |
+                    Format-List * | Out-File -FilePath $out -Encoding UTF8 -Append -Width 4096
+                $events | Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message |
+                    Export-Csv -Path (Join-Path $Script:CsvPath $check.Csv) -Encoding UTF8 -NoTypeInformation
+
+                $criticalOrError = ($events | Where-Object { $_.LevelDisplayName -match "Critical|Error|Критический|Ошибка" } | Measure-Object).Count
+
+                switch ($check.Name) {
+                    "Kernel-Power" {
+                        $Script:Metrics.KernelPowerCount = ($events | Measure-Object).Count
+                        if ($Script:Metrics.KernelPowerCount -gt 0) {
+                            Add-Finding "WARN" "Kernel-Power" "Найдены события Kernel-Power: $($Script:Metrics.KernelPowerCount)." "Проверить резкие выключения, питание, батарею, блок питания, перегрев."
+                        }
+                    }
+                    "Disk" {
+                        $Script:Metrics.DiskErrorCount += $criticalOrError
+                    }
+                    "Ntfs" {
+                        $Script:Metrics.NtfsErrorCount += $criticalOrError
+                    }
+                    "WHEA" {
+                        $Script:Metrics.WheaCount = ($events | Measure-Object).Count
+                        if ($Script:Metrics.WheaCount -gt 0) {
+                            Add-Finding "CRITICAL" "WHEA" "Найдены аппаратные WHEA-события: $($Script:Metrics.WheaCount)." "Проверить CPU/RAM/диск/питание/перегрев. WHEA часто указывает на аппаратную проблему."
+                        }
+                    }
+                    "BugCheck" {
+                        $Script:Metrics.BugCheckCount = ($events | Measure-Object).Count
+                        if ($Script:Metrics.BugCheckCount -gt 0) {
+                            Add-Finding "CRITICAL" "BugCheck" "Найдены события синих экранов/bugcheck: $($Script:Metrics.BugCheckCount)." "Проверить дампы памяти, драйверы и аппаратные ошибки."
+                        }
+                    }
+                }
+            }
+            catch {
+                Append-Text $out "Provider $($check.Name) unavailable or no events: $($_.Exception.Message)"
+            }
+        }
+    }
+    catch {
+        Write-Log "Collect-WindowsEvents failed: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Collect-Network {
+    Write-Host "Collecting network information..."
+
+    $out = Join-Path $Script:ReportsPath "10_Network.txt"
+
+    try {
+        Append-Text $out "=== IPCONFIG /ALL ==="
+        Invoke-CommandSafe -FilePath "cmd.exe" -Arguments "/c ipconfig /all" -OutputFile $out -TimeoutSeconds 120
+
+        Append-Text $out "`r`n=== NETSTAT ALL ==="
+        Invoke-CommandSafe -FilePath "cmd.exe" -Arguments "/c netstat -ano" -OutputFile $out -TimeoutSeconds 120
+
+        Append-Text $out "`r`n=== NETSTAT TCP WITH EXECUTABLES IF ADMIN ==="
+        Invoke-CommandSafe -FilePath "cmd.exe" -Arguments "/c netstat -abno" -OutputFile (Join-Path $Script:ReportsPath "10A_Netstat_ABNO.txt") -TimeoutSeconds 300
+
+        Append-Text $out "`r`n=== ROUTE PRINT ==="
+        Invoke-CommandSafe -FilePath "cmd.exe" -Arguments "/c route print" -OutputFile $out -TimeoutSeconds 120
+
+        Append-Text $out "`r`n=== ARP ==="
+        Invoke-CommandSafe -FilePath "cmd.exe" -Arguments "/c arp -a" -OutputFile $out -TimeoutSeconds 120
+
+        Append-Text $out "`r`n=== DNS CACHE ==="
+        Invoke-CommandSafe -FilePath "cmd.exe" -Arguments "/c ipconfig /displaydns" -OutputFile (Join-Path $Script:ReportsPath "10B_DNS_Cache.txt") -TimeoutSeconds 180
+
+        Append-Text $out "`r`n=== NETWORK ADAPTERS ==="
+        $adapters = Get-CimSafe -ClassName Win32_NetworkAdapter
+        Export-Object $adapters $out (Join-Path $Script:CsvPath "Network_Adapters.csv")
+
+        Append-Text $out "`r`n=== NETWORK ADAPTER CONFIGURATION ==="
+        $configs = Get-CimSafe -ClassName Win32_NetworkAdapterConfiguration
+        Export-Object $configs $out (Join-Path $Script:CsvPath "Network_Adapter_Configuration.csv")
+
+        Append-Text $out "`r`n=== TCP CONNECTIONS POWERSHELL ==="
+        try {
+            $tcp = Get-NetTCPConnection -ErrorAction Stop
+            $tcp | Export-Csv -Path (Join-Path $Script:CsvPath "Network_TCP_Connections.csv") -Encoding UTF8 -NoTypeInformation
+            $tcp | Format-Table -AutoSize | Out-String -Width 4096 | Out-File $out -Append -Encoding UTF8
+        }
+        catch {
+            Append-Text $out "Get-NetTCPConnection unavailable: $($_.Exception.Message)"
+        }
+
+        Append-Text $out "`r`n=== UDP ENDPOINTS POWERSHELL ==="
+        try {
+            $udp = Get-NetUDPEndpoint -ErrorAction Stop
+            $udp | Export-Csv -Path (Join-Path $Script:CsvPath "Network_UDP_Endpoints.csv") -Encoding UTF8 -NoTypeInformation
+            $udp | Format-Table -AutoSize | Out-String -Width 4096 | Out-File $out -Append -Encoding UTF8
+        }
+        catch {
+            Append-Text $out "Get-NetUDPEndpoint unavailable: $($_.Exception.Message)"
+        }
+
+        Append-Text $out "`r`n=== PID TO PROCESS MAP ==="
+        Get-Process | Select-Object Id, ProcessName, Path |
+            Export-Csv -Path (Join-Path $Script:CsvPath "Network_PID_Process_Map.csv") -Encoding UTF8 -NoTypeInformation
+    }
+    catch {
+        Write-Log "Collect-Network failed: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Collect-InstalledPrograms {
+    Write-Host "Collecting installed programs..."
+
+    $out = Join-Path $Script:ReportsPath "11_Installed_Programs.txt"
+
+    try {
+        $programs = @()
+        $regPaths = @(
+            "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+        )
+
+        foreach ($path in $regPaths) {
+            try {
+                $items = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
+                foreach ($item in $items) {
+                    if ($item.DisplayName) {
+                        $programs += New-Object PSObject -Property @{
+                            Name = $item.DisplayName
+                            Version = $item.DisplayVersion
+                            InstallDate = $item.InstallDate
+                            Publisher = $item.Publisher
+                            InstallLocation = $item.InstallLocation
+                            UninstallString = $item.UninstallString
+                            RegistryPath = $path
+                        }
+                    }
+                }
+            }
+            catch {
+                Write-Log "Installed programs registry path failed $path : $($_.Exception.Message)" "ERROR"
+            }
+        }
+
+        $programs = $programs | Sort-Object Name -Unique
+        $programs | Export-Csv -Path (Join-Path $Script:CsvPath "Installed_Programs.csv") -Encoding UTF8 -NoTypeInformation
+        $programs | Format-Table Name, Version, InstallDate, Publisher -AutoSize |
+            Out-String -Width 4096 | Out-File -FilePath $out -Encoding UTF8
+
+        $pupPatterns = @(
+            "MediaGet",
+            "Zona",
+            "Amigo",
+            "Mail.Ru",
+            "Sputnik",
+            "uTorrent",
+            "Torrent",
+            "DriverPack",
+            "IObit",
+            "Advanced SystemCare",
+            "Auslogics",
+            "Baidu",
+            "Tencent",
+            "360 Total",
+            "Web Companion",
+            "RelevantKnowledge",
+            "PremierOpinion",
+            "OfferCore",
+            "CCleaner"
+        )
+
+        $possiblePup = @()
+        foreach ($p in $programs) {
+            foreach ($pattern in $pupPatterns) {
+                if ($p.Name -match [regex]::Escape($pattern)) {
+                    $possiblePup += $p
+                }
+            }
+        }
+
+        if (($possiblePup | Measure-Object).Count -gt 0) {
+            $Script:Metrics.SuspiciousPrograms = $possiblePup | Select-Object -ExpandProperty Name -Unique
+            Append-Text $out "`r`n=== POSSIBLE UNWANTED / PERFORMANCE-AFFECTING SOFTWARE ==="
+            $possiblePup | Format-Table Name, Version, Publisher -AutoSize | Out-String -Width 4096 | Out-File $out -Append -Encoding UTF8
+            Add-Finding "INFO" "Software" "Найдены программы, которые могут влиять на производительность или быть нежелательными: $($Script:Metrics.SuspiciousPrograms -join ', ')." "Проверить, нужны ли эти программы. Не удалять корпоративное ПО без согласования."
+        }
+    }
+    catch {
+        Write-Log "Collect-InstalledPrograms failed: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Collect-Temperatures {
+    Write-Host "Collecting temperatures..."
+
+    $out = Join-Path $Script:ReportsPath "12_Temperatures.txt"
+
+    try {
+        Append-Text $out "=== ACPI THERMAL ZONES ==="
+        $thermal = Get-CimSafe -Namespace "root\wmi" -ClassName MSAcpi_ThermalZoneTemperature
+        if ($thermal) {
+            $thermalResults = @()
+            foreach ($t in $thermal) {
+                try {
+                    $celsius = [math]::Round(($t.CurrentTemperature / 10) - 273.15, 2)
+                    $thermalResults += New-Object PSObject -Property @{
+                        InstanceName = $t.InstanceName
+                        TemperatureC = $celsius
+                        RawCurrentTemperature = $t.CurrentTemperature
+                    }
+
+                    if ($celsius -gt 85) {
+                        Add-Finding "WARN" "Temperature" "ACPI температура высокая: $celsius C, $($t.InstanceName)." "Проверить охлаждение, пыль, термопасту, вентилятор."
+                    }
+                }
+                catch {
+                }
+            }
+            $thermalResults | Format-Table -AutoSize | Out-String -Width 4096 | Out-File $out -Encoding UTF8 -Append
+            $thermalResults | Export-Csv -Path (Join-Path $Script:CsvPath "Temperatures_ACPI.csv") -Encoding UTF8 -NoTypeInformation
+        }
+        else {
+            Append-Text $out "ACPI thermal data unavailable."
+        }
+
+        Append-Text $out "`r`n=== DISK TEMPERATURE FROM SMART ATTRIBUTE 194 / 190 IF AVAILABLE ==="
+        $smartData = Get-CimSafe -Namespace "root\wmi" -ClassName MSStorageDriver_FailurePredictData
+        $temps = @()
+        if ($smartData) {
+            foreach ($d in $smartData) {
+                $attrs = Decode-SmartAttributes -VendorSpecific $d.VendorSpecific
+                foreach ($a in $attrs) {
+                    if ($a.ID -eq 194 -or $a.ID -eq 190) {
+                        $tempValue = $a.Raw -band 0xFF
+                        $temps += New-Object PSObject -Property @{
+                            InstanceName = $d.InstanceName
+                            AttributeID = $a.ID
+                            AttributeName = $a.Name
+                            TemperatureC = $tempValue
+                            Raw = $a.Raw
+                        }
+
+                        if ($tempValue -gt 50) {
+                            Add-Finding "WARN" "Disk Temperature" "Температура накопителя высокая: $tempValue C, $($d.InstanceName)." "Проверить охлаждение. Для HDD желательно держать ниже 45-50 C."
+                        }
+                    }
+                }
+            }
+        }
+
+        if ($temps.Count -gt 0) {
+            $temps | Format-Table -AutoSize | Out-String -Width 4096 | Out-File $out -Append -Encoding UTF8
+            $temps | Export-Csv -Path (Join-Path $Script:CsvPath "Temperatures_Disk_SMART.csv") -Encoding UTF8 -NoTypeInformation
+        }
+        else {
+            Append-Text $out "SMART temperature attributes unavailable."
+        }
+
+        Append-Text $out "`r`n=== NOTE ==="
+        Append-Text $out "CPU/GPU temperature is not consistently exposed by Windows built-in tools on all systems. If firmware/WMI exposes sensors, ACPI values above are collected. No third-party sensor drivers were used."
+    }
+    catch {
+        Write-Log "Collect-Temperatures failed: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Run-SystemChecks {
+    Write-Host "Running system checks. This can take time..."
+
+    $out = Join-Path $Script:ReportsPath "13_System_Checks.txt"
+
+    try {
+        Append-Text $out "=== SFC VERIFYONLY ==="
+        Invoke-CommandSafe -FilePath "sfc.exe" -Arguments "/verifyonly" -OutputFile $out -TimeoutSeconds 3600
+
+        Append-Text $out "`r`n=== DISM SCANHEALTH ==="
+        Invoke-CommandSafe -FilePath "dism.exe" -Arguments "/Online /Cleanup-Image /ScanHealth" -OutputFile $out -TimeoutSeconds 3600
+
+        Append-Text $out "`r`n=== POWERSHELL REPAIR COMMANDS AVAILABILITY ==="
+        try {
+            Get-Command Repair-WindowsImage -ErrorAction Stop | Format-List * | Out-File $out -Append -Encoding UTF8 -Width 4096
+        }
+        catch {
+            Append-Text $out "Repair-WindowsImage not available or module not loaded."
+        }
+
+        Append-Text $out "`r`n=== POWERCFG ENERGY 60 SECONDS ==="
+        $energyHtml = Join-Path $Script:RootPath "powercfg_energy.html"
+        Invoke-CommandSafe -FilePath "powercfg.exe" -Arguments "/energy /duration 60 /output `"$energyHtml`"" -OutputFile $out -TimeoutSeconds 180
+
+        Append-Text $out "`r`n=== POWERCFG BATTERY REPORT IF SUPPORTED ==="
+        $batteryHtml = Join-Path $Script:RootPath "battery_report.html"
+        Invoke-CommandSafe -FilePath "powercfg.exe" -Arguments "/batteryreport /output `"$batteryHtml`"" -OutputFile $out -TimeoutSeconds 120
+
+        Append-Text $out "`r`n=== WINSAT CPU ==="
+        Invoke-CommandSafe -FilePath "winsat.exe" -Arguments "cpuformal" -OutputFile $out -TimeoutSeconds 1200
+
+        Append-Text $out "`r`n=== WINSAT MEMORY ==="
+        Invoke-CommandSafe -FilePath "winsat.exe" -Arguments "mem" -OutputFile $out -TimeoutSeconds 1200
+
+        Append-Text $out "`r`n=== WINSAT FEATURES ==="
+        Invoke-CommandSafe -FilePath "winsat.exe" -Arguments "features" -OutputFile $out -TimeoutSeconds 600
+    }
+    catch {
+        Write-Log "Run-SystemChecks failed: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Collect-SecurityAndMalwareIndicators {
+    Write-Host "Collecting security indicators..."
+
+    $out = Join-Path $Script:ReportsPath "14_Security_Indicators.txt"
+
+    try {
+        Append-Text $out "=== WINDOWS DEFENDER STATUS ==="
+        try {
+            $mp = Get-MpComputerStatus -ErrorAction Stop
+            Export-Object $mp $out (Join-Path $Script:CsvPath "Defender_Status.csv")
+        }
+        catch {
+            Append-Text $out "Get-MpComputerStatus unavailable: $($_.Exception.Message)"
+        }
+
+        Append-Text $out "`r`n=== LOCAL USERS ==="
+        try {
+            $users = Get-LocalUser -ErrorAction Stop
+            $users | Export-Csv -Path (Join-Path $Script:CsvPath "Local_Users.csv") -Encoding UTF8 -NoTypeInformation
+            $users | Format-Table -AutoSize | Out-String -Width 4096 | Out-File $out -Append -Encoding UTF8
+        }
+        catch {
+            Append-Text $out "Get-LocalUser unavailable. Using net user."
+            Invoke-CommandSafe -FilePath "cmd.exe" -Arguments "/c net user" -OutputFile $out -TimeoutSeconds 120
+        }
+
+        Append-Text $out "`r`n=== LOCAL ADMINISTRATORS ==="
+        Invoke-CommandSafe -FilePath "cmd.exe" -Arguments "/c net localgroup administrators" -OutputFile $out -TimeoutSeconds 120
+
+        Append-Text $out "`r`n=== HOSTS FILE ==="
+        $hosts = "$env:SystemRoot\System32\drivers\etc\hosts"
+        if (Test-Path $hosts) {
+            Get-Content $hosts -ErrorAction SilentlyContinue | Out-File $out -Append -Encoding UTF8
+        }
+
+        Append-Text $out "`r`n=== PROXY SETTINGS ==="
+        $proxyPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+        if (Test-Path $proxyPath) {
+            Get-ItemProperty -Path $proxyPath | Format-List ProxyEnable, ProxyServer, AutoConfigURL | Out-File $out -Append -Encoding UTF8 -Width 4096
+        }
+    }
+    catch {
+        Write-Log "Collect-SecurityAndMalwareIndicators failed: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Generate-Summary {
+    Write-Host "Generating summary..."
+
+    try {
+        $end = Get-Date
+        $duration = New-TimeSpan -Start $Script:StartTime -End $end
+
+        Append-Text $Script:SummaryFile "PC DIAGNOSTICS SUMMARY"
+        Append-Text $Script:SummaryFile "Generated: $end"
+        Append-Text $Script:SummaryFile "Duration: $($duration.ToString())"
+        Append-Text $Script:SummaryFile "Computer: $env:COMPUTERNAME"
+        Append-Text $Script:SummaryFile "User: $env:USERNAME"
+        Append-Text $Script:SummaryFile "Root folder: $Script:RootPath"
+        Append-Text $Script:SummaryFile ""
+
+        Append-Text $Script:SummaryFile "=== QUICK METRICS ==="
+        Append-Text $Script:SummaryFile ("Average CPU 60s: {0}%" -f $Script:Metrics.AvgCpu)
+        Append-Text $Script:SummaryFile ("Max CPU 60s: {0}%" -f $Script:Metrics.MaxCpu)
+        Append-Text $Script:SummaryFile ("Average Available RAM 60s: {0} MB" -f $Script:Metrics.AvgAvailableMemoryMB)
+        Append-Text $Script:SummaryFile ("Minimum Available RAM 60s: {0} MB" -f $Script:Metrics.MinAvailableMemoryMB)
+        Append-Text $Script:SummaryFile ("Average Disk Queue 60s: {0}" -f $Script:Metrics.AvgDiskQueue)
+        Append-Text $Script:SummaryFile ("Max Disk Queue 60s: {0}" -f $Script:Metrics.MaxDiskQueue)
+        Append-Text $Script:SummaryFile ("Average Disk Read MB/s 60s: {0}" -f $Script:Metrics.AvgDiskReadMBs)
+        Append-Text $Script:SummaryFile ("Average Disk Write MB/s 60s: {0}" -f $Script:Metrics.AvgDiskWriteMBs)
+        Append-Text $Script:SummaryFile ("Disk error count: {0}" -f $Script:Metrics.DiskErrorCount)
+        Append-Text $Script:SummaryFile ("NTFS error count: {0}" -f $Script:Metrics.NtfsErrorCount)
+        Append-Text $Script:SummaryFile ("Kernel-Power events: {0}" -f $Script:Metrics.KernelPowerCount)
+        Append-Text $Script:SummaryFile ("WHEA events: {0}" -f $Script:Metrics.WheaCount)
+        Append-Text $Script:SummaryFile ("BugCheck events: {0}" -f $Script:Metrics.BugCheckCount)
+        Append-Text $Script:SummaryFile ("Unsigned drivers: {0}" -f $Script:Metrics.UnsignedDriverCount)
+        Append-Text $Script:SummaryFile ("Startup items collected: {0}" -f $Script:Metrics.StartupCount)
+        Append-Text $Script:SummaryFile ("SMART warnings: {0}" -f $Script:Metrics.SmartWarningCount)
+        Append-Text $Script:SummaryFile ""
+
+        if ($Script:Metrics.SmartWarningCount -gt 0) {
+            Add-Finding "CRITICAL" "Storage" "Обнаружены SMART-признаки проблем накопителя." "Сделать резервную копию и рассмотреть замену диска, особенно если это HDD."
+        }
+
+        if ($Script:Metrics.DiskErrorCount -gt 0) {
+            Add-Finding "CRITICAL" "Storage" "Обнаружены ошибки Disk в журналах Windows." "Проверить SMART, выполнить backup, проверить кабели/контакты, заменить диск при повторении ошибок."
+        }
+
+        if ($Script:Metrics.NtfsErrorCount -gt 0) {
+            Add-Finding "WARN" "File System" "Обнаружены ошибки NTFS." "Проверить файловую систему chkdsk и состояние накопителя."
+        }
+
+        if ($Script:Findings.Count -eq 0) {
+            Add-Finding "OK" "General" "Критичных проблем автоматически не обнаружено." "Открыть отчеты вручную для детального анализа."
+        }
+
+        Append-Text $Script:SummaryFile "=== AUTOMATIC FINDINGS ==="
+        $ordered = $Script:Findings | Sort-Object @{
+            Expression = {
+                switch ($_.Severity) {
+                    "CRITICAL" { 1 }
+                    "WARN" { 2 }
+                    "INFO" { 3 }
+                    "OK" { 4 }
+                    default { 5 }
+                }
+            }
+        }, Category
+
+        foreach ($f in $ordered) {
+            Append-Text $Script:SummaryFile ("[{0}] {1}: {2}" -f $f.Severity, $f.Category, $f.Message)
+            Append-Text $Script:SummaryFile ("Recommendation: {0}" -f $f.Recommendation)
+            Append-Text $Script:SummaryFile ""
+        }
+
+        Append-Text $Script:SummaryFile "=== WHAT TO SEND FOR ANALYSIS ==="
+        Append-Text $Script:SummaryFile "Send the generated ZIP archive to the engineer or upload it to ChatGPT."
+        Append-Text $Script:SummaryFile "Most useful files:"
+        Append-Text $Script:SummaryFile "1. SUMMARY.txt"
+        Append-Text $Script:SummaryFile "2. Reports\02_Disks.txt"
+        Append-Text $Script:SummaryFile "3. CSV\SMART_Attributes.csv"
+        Append-Text $Script:SummaryFile "4. CSV\Performance_60s.csv"
+        Append-Text $Script:SummaryFile "5. Reports\09_Windows_Events.txt"
+        Append-Text $Script:SummaryFile "6. Reports\05_Processes.txt"
+        Append-Text $Script:SummaryFile ""
+        Append-Text $Script:SummaryFile "=== LIMITATIONS ==="
+        Append-Text $Script:SummaryFile "Only built-in Windows tools were used."
+        Append-Text $Script:SummaryFile "Some temperature sensors may be unavailable without vendor drivers."
+        Append-Text $Script:SummaryFile "Full per-process open-file enumeration is not reliably available on all Windows versions without third-party tools."
+    }
+    catch {
+        Write-Log "Generate-Summary failed: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Create-ZipArchive {
+    Write-Host "Creating ZIP archive..."
+
+    try {
+        if (Test-Path $Script:ZipPath) {
+            Remove-Item $Script:ZipPath -Force -ErrorAction SilentlyContinue
+        }
+
+        try {
+            Compress-Archive -Path (Join-Path $Script:RootPath "*") -DestinationPath $Script:ZipPath -Force -ErrorAction Stop
+        }
+        catch {
+            Write-Log "Compress-Archive failed, trying .NET ZipFile: $($_.Exception.Message)" "WARN"
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            [System.IO.Compression.ZipFile]::CreateFromDirectory($Script:RootPath, $Script:ZipPath)
+        }
+
+        Append-Text $Script:SummaryFile ""
+        Append-Text $Script:SummaryFile "ZIP archive: $Script:ZipPath"
+    }
+    catch {
+        Write-Log "Create-ZipArchive failed: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Show-FinalMessage {
+    Write-Host ""
+    Write-Host "Diagnostics completed."
+    Write-Host "Folder: $Script:RootPath"
+    Write-Host "Summary: $Script:SummaryFile"
+    Write-Host "ZIP: $Script:ZipPath"
+    Write-Host ""
+}
+
+function Main {
+    Initialize-Environment
+
+    Write-Host "PC Diagnostics started..."
+    Write-Host "Output folder: $Script:RootPath"
+    Write-Host ""
+
+    Collect-SystemInformation
+    Collect-DiskInformation
+    Collect-MemoryInformation
+    Monitor-Performance
+    Collect-Processes
+    Collect-Startup
+    Collect-Services
+    Collect-Drivers
+    Collect-WindowsEvents
+    Collect-Network
+    Collect-InstalledPrograms
+    Collect-Temperatures
+    Run-SystemChecks
+    Collect-SecurityAndMalwareIndicators
+    Generate-Summary
+    Create-ZipArchive
+    Show-FinalMessage
+}
+
+Main
